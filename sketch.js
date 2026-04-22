@@ -52,14 +52,12 @@ let pCool=[[0,0,0,0],[0,0,0,0]];
 let pDist=[[1,1,1,1],[1,1,1,1]];
 
 // ── VISUAL STATE ──────────────────────────────────────────────────────────────
-// Fixed-size ring buffers — NEVER grow, NEVER leak
 const CAP={r:30,g:25,p:60,s:10,b:20};
 let ripples=[], glows=[], particles=[], shocks=[], bursts=[];
 
 // ── AUDIO STATE ───────────────────────────────────────────────────────────────
 let actx=null, analyser=null, keyAnalyser=null;
 let dataArray=null, keyDataArray=null;
-let reverbBuf=null;       // created ONCE, reused forever
 let vocalEQ=null, vocalOn=false;
 let uploadedAudio=null, sourceNode=null;
 let sBands=new Array(8).fill(0);
@@ -69,6 +67,81 @@ let detRoot=9, detScale='minor_penta';
 let chromaAcc=new Array(12).fill(0), chromaN=0;
 let scaleNotes=[], masterVol=0.8, tempo=1.0;
 let keyDetectTimer=0;
+
+// ── VOICE POOL — 8 pre-built voices, zero runtime allocation ──────────────────
+const POOL_SIZE=8;
+let pool=[], poolIdx=0;
+let poolReady=false;
+
+function buildPool(){
+  if(poolReady||!actx) return;
+  // shared reverb IR — built once
+  const irLen=actx.sampleRate*1.0;
+  const irBuf=actx.createBuffer(2,irLen,actx.sampleRate);
+  for(let ch=0;ch<2;ch++){
+    const d=irBuf.getChannelData(ch);
+    for(let i=0;i<irLen;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/irLen,3);
+  }
+  for(let v=0;v<POOL_SIZE;v++){
+    const mG=actx.createGain(); mG.gain.value=0;
+    const fl=actx.createBiquadFilter(); fl.type='lowpass'; fl.Q.value=0.5;
+    const conv=actx.createConvolver(); conv.buffer=irBuf;
+    const cG=actx.createGain(); cG.gain.value=0.14;
+    mG.connect(fl); fl.connect(actx.destination);
+    mG.connect(conv); conv.connect(cG); cG.connect(actx.destination);
+    pool.push({mG,fl,conv,cG,busy:false,stopAt:0});
+  }
+  poolReady=true;
+}
+
+function playNote(fi,hand,vol){
+  ensureAudio();
+  if(!scaleNotes.length||!poolReady) return;
+  const freq=hand===0?scaleNotes[fi].freq_l:scaleNotes[fi].freq_r;
+  const dur=hand===0?0.5:0.65;
+  const t=actx.currentTime;
+
+  // find a free voice — steal oldest if all busy
+  let v=null;
+  for(let i=0;i<POOL_SIZE;i++){
+    const idx=(poolIdx+i)%POOL_SIZE;
+    if(!pool[idx].busy||t>=pool[idx].stopAt){ v=pool[idx]; poolIdx=(idx+1)%POOL_SIZE; break; }
+  }
+  if(!v){ v=pool[poolIdx]; poolIdx=(poolIdx+1)%POOL_SIZE; }
+
+  v.busy=true;
+  v.stopAt=t+dur;
+
+  // set filter cutoff per hand
+  v.fl.frequency.setValueAtTime(hand===0?800:3800, t);
+
+  // create oscillators — these are lightweight, short-lived, self-GC after stop
+  const o1=actx.createOscillator(), o2=actx.createOscillator();
+  const lfo=actx.createOscillator(), lG=actx.createGain();
+  const mx=actx.createGain();
+
+  lfo.frequency.value=5.5; lG.gain.value=freq*0.006;
+  lfo.connect(lG); lG.connect(o1.frequency); lG.connect(o2.frequency);
+  o1.type='sine'; o1.frequency.value=freq;
+  o2.type='sine'; o2.frequency.value=freq*1.0025;
+  mx.gain.value=0.5; o1.connect(mx); o2.connect(mx);
+  mx.connect(v.mG);
+
+  const vv=constrain(vol*0.42*(1+bassP*0.12),0.02,0.85);
+  v.mG.gain.cancelScheduledValues(t);
+  v.mG.gain.setValueAtTime(0,t);
+  v.mG.gain.linearRampToValueAtTime(vv,t+0.06);
+  v.mG.gain.setValueAtTime(vv,t+dur*0.55);
+  v.mG.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+
+  o1.start(t); o1.stop(t+dur);
+  o2.start(t); o2.stop(t+dur);
+  lfo.start(t); lfo.stop(t+dur);
+
+  // oscillators auto-GC after stop — no manual disconnect needed
+  // mark voice free after note ends
+  setTimeout(()=>{ v.busy=false; v.mG.gain.setValueAtTime(0,actx.currentTime); }, (dur+0.05)*1000);
+}
 
 // ── MEDIAPIPE ─────────────────────────────────────────────────────────────────
 function clearHand(h){
@@ -99,7 +172,6 @@ function initMediaPipe(){
       const slot=(ness[i]?.label==='Right')?0:1;
       sorted[slot]=raw[i];
     }
-    // use performance.now() consistently — never mix with millis()
     const now=performance.now();
     for(let h=0;h<2;h++){
       if(sorted[h]){
@@ -112,7 +184,6 @@ function initMediaPipe(){
       }
     }
   });
-  // no async/await on onFrame — fire and forget, never queue
   const cam=new Camera(vid,{
     onFrame:()=>{ mp.send({image:vid}); },
     width:320, height:240
@@ -143,18 +214,11 @@ function initAudio(){
   keyAnalyser.fftSize=8192;
   keyAnalyser.smoothingTimeConstant=0.9;
   keyDataArray=new Uint8Array(keyAnalyser.frequencyBinCount);
-
-  // build reverb IR once, reuse on every note — never allocate again
-  const irLen=actx.sampleRate*1.2;
-  reverbBuf=actx.createBuffer(2,irLen,actx.sampleRate);
-  for(let ch=0;ch<2;ch++){
-    const d=reverbBuf.getChannelData(ch);
-    for(let i=0;i<irLen;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/irLen,3);
-  }
 }
 
 function ensureAudio(){
   initAudio();
+  buildPool();
   if(actx.state==='suspended') actx.resume().catch(()=>{});
 }
 
@@ -286,51 +350,6 @@ function rebuildNotes(){
   }
 }
 
-function playNote(fi,hand,vol){
-  ensureAudio();
-  if(!scaleNotes.length||!reverbBuf) return;
-  const freq=hand===0?scaleNotes[fi].freq_l:scaleNotes[fi].freq_r;
-  const dur=hand===0?0.5:0.65;
-
-  const conv=actx.createConvolver();
-  conv.buffer=reverbBuf; // shared buffer — no allocation
-  const cG=actx.createGain(); cG.gain.value=0.16;
-  const o1=actx.createOscillator(), o2=actx.createOscillator();
-  const lfo=actx.createOscillator(), lG=actx.createGain();
-  const mx=actx.createGain(), fl=actx.createBiquadFilter(), mG=actx.createGain();
-
-  lfo.frequency.value=5.5; lG.gain.value=freq*0.006;
-  lfo.connect(lG); lG.connect(o1.frequency); lG.connect(o2.frequency);
-  o1.type='sine'; o1.frequency.value=freq;
-  o2.type='sine'; o2.frequency.value=freq*1.0025;
-  fl.type='lowpass'; fl.frequency.value=hand===0?800:3800; fl.Q.value=0.5;
-  mx.gain.value=0.5; o1.connect(mx); o2.connect(mx);
-  mx.connect(fl); fl.connect(mG);
-  mG.connect(actx.destination);
-  mG.connect(conv); conv.connect(cG); cG.connect(actx.destination);
-
-  const t=actx.currentTime, v=constrain(vol*0.42*(1+bassP*0.12),0.02,0.85);
-  mG.gain.setValueAtTime(0,t);
-  mG.gain.linearRampToValueAtTime(v,t+0.06);
-  mG.gain.setValueAtTime(v,t+dur*0.55);
-  mG.gain.exponentialRampToValueAtTime(0.0001,t+dur);
-
-  o1.start(t); o1.stop(t+dur);
-  o2.start(t); o2.stop(t+dur);
-  lfo.start(t); lfo.stop(t+dur);
-
-  // guaranteed cleanup via setTimeout — more reliable than onended
-  // fires after note is fully done + 200ms safety margin
-  setTimeout(()=>{
-    try{
-      lfo.disconnect(); lG.disconnect();
-      o1.disconnect(); o2.disconnect();
-      mx.disconnect(); fl.disconnect(); mG.disconnect();
-      conv.disconnect(); cG.disconnect();
-    }catch(e){}
-  }, (dur+0.2)*1000);
-}
-
 // ── UI ────────────────────────────────────────────────────────────────────────
 function buildUI(){
   const link=document.createElement('link');
@@ -452,7 +471,6 @@ function jColor(h,k,alpha){
 function draw(){
   analyzeAudio();
 
-  // ghost-hand kill — use performance.now() consistently
   const now=performance.now();
   for(let h=0;h<2;h++) if(now-handLastSeen[h]>200) clearHand(h);
 
@@ -476,7 +494,6 @@ function draw(){
   noStroke(); fill(0,0,0,map(beatP,0,1,18,2)); rect(0,0,width,height);
   if(flashA>1){ fill(255,30,180,flashA); rect(0,0,width,height); }
 
-  // spectrum arc
   if(analyser){
     drawingContext.save(); drawingContext.globalCompositeOperation='screen';
     const bc=120, cx=width/2, cy=height+155, rad=height*.68;
@@ -491,7 +508,6 @@ function draw(){
     noStroke(); drawingContext.restore();
   }
 
-  // aura rings
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
   for(let b=0;b<8;b++){
     if(sBands[b]<.04) continue;
@@ -501,7 +517,6 @@ function draw(){
   }
   drawingContext.restore();
 
-  // beat rings
   if(bassP>.46){
     drawingContext.save(); drawingContext.globalCompositeOperation='screen'; noFill();
     for(let k=0;k<4;k++){
@@ -511,12 +526,11 @@ function draw(){
     drawingContext.restore();
   }
 
-  // effects — hard cap then draw
-  if(ripples.length>CAP.r)   ripples.length=CAP.r;
-  if(glows.length>CAP.g)     glows.length=CAP.g;
+  if(ripples.length>CAP.r) ripples.length=CAP.r;
+  if(glows.length>CAP.g)   glows.length=CAP.g;
   if(particles.length>CAP.p) particles.length=CAP.p;
-  if(shocks.length>CAP.s)    shocks.length=CAP.s;
-  if(bursts.length>CAP.b)    bursts.length=CAP.b;
+  if(shocks.length>CAP.s)  shocks.length=CAP.s;
+  if(bursts.length>CAP.b)  bursts.length=CAP.b;
 
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
   for(let i=shocks.length-1;i>=0;i--){
@@ -552,7 +566,7 @@ function draw(){
   }
   drawingContext.restore();
 
-  // hands
+  // hands — no trails anywhere
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
   for(let h=0;h<2;h++){
     if(!smoothLms[h]||smoothLms[h].length!==21) continue;
@@ -589,7 +603,6 @@ function draw(){
       prevJ[h][k]={x:kx,y:ky};
     }
 
-    // pinch — raw distance trigger, instant response
     const tx0=lms[THUMB_TIP].x, ty0=lms[THUMB_TIP].y;
     for(let fi=0;fi<4;fi++){
       const ti=FINGER_TIPS[fi], tx=lms[ti].x, ty=lms[ti].y;
@@ -625,7 +638,6 @@ function draw(){
       }
     }
 
-    // skeleton
     const bM=1+beatP*.55;
     const conn=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
     for(const[a,bb]of conn){
@@ -633,7 +645,6 @@ function draw(){
       stroke(r,g,b,140*dep*bM); strokeWeight(1.5*dep); line(lms[a].x,lms[a].y,lms[bb].x,lms[bb].y);
     }
 
-    // joints
     const tipSet=new Set([...FINGER_TIPS,THUMB_TIP]);
     for(let k=0;k<21;k++){
       const kx=lms[k].x, ky=lms[k].y;

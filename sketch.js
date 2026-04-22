@@ -60,7 +60,6 @@ let detRoot=9, detScale='minor_penta';
 let chromaAcc=new Array(12).fill(0), chromaN=0;
 let scaleNotes=[], masterVol=0.8, tempo=1.0, keyDetectTimer=0;
 
-// voice pool — zero allocation per note
 const POOL_SIZE=8;
 let pool=[], poolIdx=0, poolReady=false;
 function buildPool(){
@@ -111,7 +110,6 @@ function playNote(fi,hand,vol){
   setTimeout(()=>{v.busy=false;if(actx)v.mG.gain.setValueAtTime(0,actx.currentTime);},(dur+0.1)*1000);
 }
 
-// mpHands stored globally — never garbage collected
 let mpHands=null;
 function clearHand(h){
   handLandmarks[h]=null; smoothLms[h]=[];
@@ -123,7 +121,11 @@ function clearHand(h){
 }
 function initMediaPipe(){
   const vid=document.getElementById('camFeed');
-  mpHands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+  // force non-SIMD wasm — SIMD causes memory access crash on many browsers
+  mpHands=new Hands({locateFile:f=>{
+    if(f.includes('simd')) return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f.replace('_simd','')}`;
+    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`;
+  }});
   mpHands.setOptions({maxNumHands:2,modelComplexity:0,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
   mpHands.onResults(r=>{
     const raw=r.multiHandLandmarks||[], ness=r.multiHandedness||[], sorted=[null,null];

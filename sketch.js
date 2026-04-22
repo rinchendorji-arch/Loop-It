@@ -122,10 +122,8 @@ function clearHand(h){
 function initMediaPipe(){
   const vid=document.getElementById('camFeed');
   // force non-SIMD wasm — SIMD causes memory access crash on many browsers
-  mpHands=new Hands({locateFile:f=>{
-    if(f.includes('simd')) return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f.replace('_simd','')}`;
-    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`;
-  }});
+  mpHands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`});
+  
   mpHands.setOptions({maxNumHands:2,modelComplexity:0,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
   mpHands.onResults(r=>{
     const raw=r.multiHandLandmarks||[], ness=r.multiHandedness||[], sorted=[null,null];

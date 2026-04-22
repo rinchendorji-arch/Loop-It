@@ -14,7 +14,7 @@ const MAJOR_P     = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88
 const MINOR_P     = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 
 // ── 1€ FILTER ─────────────────────────────────────────────────────────────────
-const OE_HZ=60, OE_MINCF=1.0, OE_BETA=0.4, OE_DC=1.0;
+const OE_HZ=30, OE_MINCF=1.0, OE_BETA=0.4, OE_DC=1.0;
 function oeA(cf){ const te=1/OE_HZ, tau=1/(6.2832*cf); return 1/(1+tau/te); }
 let smoothLms=[[],[]];
 let _oeX=[[],[]], _oeY=[[],[]], _oeDX=[[],[]], _oeDY=[[],[]];
@@ -51,8 +51,8 @@ let pState=[[false,false,false,false],[false,false,false,false]];
 let pCool=[[0,0,0,0],[0,0,0,0]];
 let pDist=[[1,1,1,1],[1,1,1,1]];
 
-// ── VISUAL STATE ──────────────────────────────────────────────────────────────
-const CAP={r:30,g:25,p:60,s:10,b:20};
+// ── VISUAL STATE — no trails ──────────────────────────────────────────────────
+const CAP={r:25,g:20,p:50,s:8,b:15};
 let ripples=[], glows=[], particles=[], shocks=[], bursts=[];
 
 // ── AUDIO STATE ───────────────────────────────────────────────────────────────
@@ -68,14 +68,12 @@ let chromaAcc=new Array(12).fill(0), chromaN=0;
 let scaleNotes=[], masterVol=0.8, tempo=1.0;
 let keyDetectTimer=0;
 
-// ── VOICE POOL — 8 pre-built voices, zero runtime allocation ──────────────────
+// ── VOICE POOL — 8 pre-wired voices, zero runtime audio allocation ─────────────
 const POOL_SIZE=8;
-let pool=[], poolIdx=0;
-let poolReady=false;
+let pool=[], poolIdx=0, poolReady=false;
 
 function buildPool(){
   if(poolReady||!actx) return;
-  // shared reverb IR — built once
   const irLen=actx.sampleRate*1.0;
   const irBuf=actx.createBuffer(2,irLen,actx.sampleRate);
   for(let ch=0;ch<2;ch++){
@@ -86,10 +84,10 @@ function buildPool(){
     const mG=actx.createGain(); mG.gain.value=0;
     const fl=actx.createBiquadFilter(); fl.type='lowpass'; fl.Q.value=0.5;
     const conv=actx.createConvolver(); conv.buffer=irBuf;
-    const cG=actx.createGain(); cG.gain.value=0.14;
+    const cG=actx.createGain(); cG.gain.value=0.13;
     mG.connect(fl); fl.connect(actx.destination);
     mG.connect(conv); conv.connect(cG); cG.connect(actx.destination);
-    pool.push({mG,fl,conv,cG,busy:false,stopAt:0});
+    pool.push({mG,fl,busy:false,stopAt:0});
   }
   poolReady=true;
 }
@@ -101,25 +99,23 @@ function playNote(fi,hand,vol){
   const dur=hand===0?0.5:0.65;
   const t=actx.currentTime;
 
-  // find a free voice — steal oldest if all busy
-  let v=null;
+  // find free voice, steal oldest if all busy
+  let v=null, oldest=null, oldestStop=Infinity;
   for(let i=0;i<POOL_SIZE;i++){
-    const idx=(poolIdx+i)%POOL_SIZE;
-    if(!pool[idx].busy||t>=pool[idx].stopAt){ v=pool[idx]; poolIdx=(idx+1)%POOL_SIZE; break; }
+    const c=pool[(poolIdx+i)%POOL_SIZE];
+    if(!c.busy||t>=c.stopAt){ v=c; poolIdx=(poolIdx+i+1)%POOL_SIZE; break; }
+    if(c.stopAt<oldestStop){ oldestStop=c.stopAt; oldest=c; }
   }
-  if(!v){ v=pool[poolIdx]; poolIdx=(poolIdx+1)%POOL_SIZE; }
+  if(!v){ v=oldest; }
+  if(!v) return;
 
   v.busy=true;
   v.stopAt=t+dur;
+  v.fl.frequency.setValueAtTime(hand===0?800:3800,t);
 
-  // set filter cutoff per hand
-  v.fl.frequency.setValueAtTime(hand===0?800:3800, t);
-
-  // create oscillators — these are lightweight, short-lived, self-GC after stop
   const o1=actx.createOscillator(), o2=actx.createOscillator();
   const lfo=actx.createOscillator(), lG=actx.createGain();
   const mx=actx.createGain();
-
   lfo.frequency.value=5.5; lG.gain.value=freq*0.006;
   lfo.connect(lG); lG.connect(o1.frequency); lG.connect(o2.frequency);
   o1.type='sine'; o1.frequency.value=freq;
@@ -138,12 +134,13 @@ function playNote(fi,hand,vol){
   o2.start(t); o2.stop(t+dur);
   lfo.start(t); lfo.stop(t+dur);
 
-  // oscillators auto-GC after stop — no manual disconnect needed
-  // mark voice free after note ends
-  setTimeout(()=>{ v.busy=false; v.mG.gain.setValueAtTime(0,actx.currentTime); }, (dur+0.05)*1000);
+  setTimeout(()=>{
+    v.busy=false;
+    if(actx) v.mG.gain.setValueAtTime(0,actx.currentTime);
+  },(dur+0.1)*1000);
 }
 
-// ── MEDIAPIPE ─────────────────────────────────────────────────────────────────
+// ── MEDIAPIPE — throttled to 30fps to prevent WASM memory buildup ─────────────
 function clearHand(h){
   handLandmarks[h]=null;
   smoothLms[h]=[];
@@ -161,8 +158,8 @@ function initMediaPipe(){
   mp.setOptions({
     maxNumHands:2,
     modelComplexity:0,
-    minDetectionConfidence:0.65,
-    minTrackingConfidence:0.65
+    minDetectionConfidence:0.6,
+    minTrackingConfidence:0.6
   });
   mp.onResults(r=>{
     const raw=r.multiHandLandmarks||[];
@@ -184,8 +181,10 @@ function initMediaPipe(){
       }
     }
   });
+  // throttle to every other frame — halves WASM memory pressure
+  let _mpTick=0;
   const cam=new Camera(vid,{
-    onFrame:()=>{ mp.send({image:vid}); },
+    onFrame:()=>{ if(_mpTick++%2===0) mp.send({image:vid}); },
     width:320, height:240
   });
   cam.start();
@@ -292,7 +291,7 @@ function analyzeAudio(){
     }
     lastBeat=now;
   }
-  if(millis()-keyDetectTimer>600){ keyDetectTimer=millis(); detectKey(); }
+  if(millis()-keyDetectTimer>800){ keyDetectTimer=millis(); detectKey(); }
   if(uploadedAudio){
     const td=document.getElementById('timeDisp');
     if(td) td.innerText=fmt(uploadedAudio.currentTime)+' / '+fmt(uploadedAudio.duration||0);
@@ -472,7 +471,7 @@ function draw(){
   analyzeAudio();
 
   const now=performance.now();
-  for(let h=0;h<2;h++) if(now-handLastSeen[h]>200) clearHand(h);
+  for(let h=0;h<2;h++) if(now-handLastSeen[h]>300) clearHand(h);
 
   const vid=document.getElementById('camFeed');
 
@@ -526,6 +525,7 @@ function draw(){
     drawingContext.restore();
   }
 
+  // hard cap arrays before drawing
   if(ripples.length>CAP.r) ripples.length=CAP.r;
   if(glows.length>CAP.g)   glows.length=CAP.g;
   if(particles.length>CAP.p) particles.length=CAP.p;
@@ -566,7 +566,7 @@ function draw(){
   }
   drawingContext.restore();
 
-  // hands — no trails anywhere
+  // ── HANDS — no trails ─────────────────────────────────────────────────────
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
   for(let h=0;h<2;h++){
     if(!smoothLms[h]||smoothLms[h].length!==21) continue;
@@ -603,6 +603,7 @@ function draw(){
       prevJ[h][k]={x:kx,y:ky};
     }
 
+    // pinch — raw distance, instant trigger
     const tx0=lms[THUMB_TIP].x, ty0=lms[THUMB_TIP].y;
     for(let fi=0;fi<4;fi++){
       const ti=FINGER_TIPS[fi], tx=lms[ti].x, ty=lms[ti].y;
@@ -618,8 +619,8 @@ function draw(){
         glows.push({x:mx,y:my,r:7,spd:14,a:90,fade:5,c:color(255,255,255)});
         for(let k=0;k<5;k++) ripples.push({x:mx,y:my,r:k*8,spd:4+k*2+beatP*3,a:105,c:fc});
         shocks.push({x:mx,y:my,r:10,spd:7+beatP*5,a:90,c:fc});
-        for(let k=0;k<12;k++){const ang=random(TWO_PI),s=random(2,9+beatP*4);particles.push({x:mx,y:my,vx:cos(ang)*s,vy:sin(ang)*s-2,life:random(35,85),r:random(2,6),c:fc});}
-        for(let k=0;k<3;k++) bursts.push({x:mx+random(-15,15),y:my+random(-15,15),size:random(7,16),grow:random(.7,1.8),life:random(28,58),c:fc});
+        for(let k=0;k<10;k++){const ang=random(TWO_PI),s=random(2,8+beatP*3);particles.push({x:mx,y:my,vx:cos(ang)*s,vy:sin(ang)*s-2,life:random(30,70),r:random(2,5),c:fc});}
+        for(let k=0;k<3;k++) bursts.push({x:mx+random(-12,12),y:my+random(-12,12),size:random(6,14),grow:random(.6,1.6),life:random(25,55),c:fc});
         const el=document.getElementById((h===0?'ln':'rn')+fi);
         if(el){
           el.style.background=FINGER_COLS[fi]+'30'; el.style.color='#fff'; el.style.borderColor=FINGER_COLS[fi]+'80';
@@ -638,6 +639,7 @@ function draw(){
       }
     }
 
+    // skeleton
     const bM=1+beatP*.55;
     const conn=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
     for(const[a,bb]of conn){
@@ -645,6 +647,7 @@ function draw(){
       stroke(r,g,b,140*dep*bM); strokeWeight(1.5*dep); line(lms[a].x,lms[a].y,lms[bb].x,lms[bb].y);
     }
 
+    // joints
     const tipSet=new Set([...FINGER_TIPS,THUMB_TIP]);
     for(let k=0;k<21;k++){
       const kx=lms[k].x, ky=lms[k].y;

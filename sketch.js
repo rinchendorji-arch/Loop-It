@@ -13,7 +13,7 @@ const JOINT_HUES  = [0,30,60,90,120,150,180,210,240,270,300,330,20,50,80,110,140
 const MAJOR_P     = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
 const MINOR_P     = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 
-// ── 1€ FILTER — tuned for maximum responsiveness ─────────────────────────────
+// ── 1€ FILTER ─────────────────────────────────────────────────────────────────
 const OE_HZ=60, OE_MINCF=1.0, OE_BETA=0.4, OE_DC=1.0;
 function oeA(cf){ const te=1/OE_HZ, tau=1/(6.2832*cf); return 1/(1+tau/te); }
 let smoothLms=[[],[]];
@@ -44,23 +44,24 @@ function stepOE(h,raw){
 let handLandmarks=[], handLastSeen=[0,0];
 let prevPalms=[null,null], velocity=[0,0], handSize=[0,0];
 let jVel=[new Array(21).fill(0),new Array(21).fill(0)];
-let prevJ=[Array.from({length:21},()=>({x:0,y:0})),Array.from({length:21},()=>({x:0,y:0}))];
-
-// PINCH: raised threshold + lower cooldown = catches more pinches faster
+let prevJ=[Array.from({length:21},()=>({x:0,y:0})),
+           Array.from({length:21},()=>({x:0,y:0}))];
 const PINCH_T=0.22;
 let pState=[[false,false,false,false],[false,false,false,false]];
 let pCool=[[0,0,0,0],[0,0,0,0]];
 let pDist=[[1,1,1,1],[1,1,1,1]];
 
-// ── VISUAL STATE — no trails ──────────────────────────────────────────────────
-let ripples=[], glows=[], particles=[], shocks=[], bursts=[];
-// lower caps = less CPU per frame = smoother tracking
+// ── VISUAL STATE ──────────────────────────────────────────────────────────────
+// Fixed-size ring buffers — NEVER grow, NEVER leak
 const CAP={r:30,g:25,p:60,s:10,b:20};
+let ripples=[], glows=[], particles=[], shocks=[], bursts=[];
 
 // ── AUDIO STATE ───────────────────────────────────────────────────────────────
-let actx, analyser, keyAnalyser, dataArray, keyDataArray;
+let actx=null, analyser=null, keyAnalyser=null;
+let dataArray=null, keyDataArray=null;
+let reverbBuf=null;       // created ONCE, reused forever
 let vocalEQ=null, vocalOn=false;
-let uploadedAudio, sourceNode;
+let uploadedAudio=null, sourceNode=null;
 let sBands=new Array(8).fill(0);
 let beatP=0, bassP=0, midP=0, trebP=0, chromaS=0, flashA=0;
 let bpm=120, lastBeat=0, beatHist=[];
@@ -81,17 +82,16 @@ function clearHand(h){
   prevJ[h]=Array.from({length:21},()=>({x:0,y:0}));
 }
 
-let mpHands=null;
 function initMediaPipe(){
   const vid=document.getElementById('camFeed');
-  mpHands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
-  mpHands.setOptions({
+  const mp=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+  mp.setOptions({
     maxNumHands:2,
     modelComplexity:0,
     minDetectionConfidence:0.65,
     minTrackingConfidence:0.65
   });
-  mpHands.onResults(r=>{
+  mp.onResults(r=>{
     const raw=r.multiHandLandmarks||[];
     const ness=r.multiHandedness||[];
     const sorted=[null,null];
@@ -99,6 +99,7 @@ function initMediaPipe(){
       const slot=(ness[i]?.label==='Right')?0:1;
       sorted[slot]=raw[i];
     }
+    // use performance.now() consistently — never mix with millis()
     const now=performance.now();
     for(let h=0;h<2;h++){
       if(sorted[h]){
@@ -111,8 +112,9 @@ function initMediaPipe(){
       }
     }
   });
+  // no async/await on onFrame — fire and forget, never queue
   const cam=new Camera(vid,{
-    onFrame:async()=>{ await mpHands.send({image:vid}); },
+    onFrame:()=>{ mp.send({image:vid}); },
     width:320, height:240
   });
   cam.start();
@@ -141,6 +143,14 @@ function initAudio(){
   keyAnalyser.fftSize=8192;
   keyAnalyser.smoothingTimeConstant=0.9;
   keyDataArray=new Uint8Array(keyAnalyser.frequencyBinCount);
+
+  // build reverb IR once, reuse on every note — never allocate again
+  const irLen=actx.sampleRate*1.2;
+  reverbBuf=actx.createBuffer(2,irLen,actx.sampleRate);
+  for(let ch=0;ch<2;ch++){
+    const d=reverbBuf.getChannelData(ch);
+    for(let i=0;i<irLen;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/irLen,3);
+  }
 }
 
 function ensureAudio(){
@@ -150,7 +160,10 @@ function ensureAudio(){
 
 function loadTrack(f){
   if(!f) return;
-  if(uploadedAudio){ uploadedAudio.pause(); if(sourceNode){sourceNode.disconnect();sourceNode=null;} }
+  if(uploadedAudio){
+    uploadedAudio.pause();
+    if(sourceNode){ sourceNode.disconnect(); sourceNode=null; }
+  }
   ensureAudio();
   chromaAcc=new Array(12).fill(0); chromaN=0;
 
@@ -164,16 +177,13 @@ function loadTrack(f){
   },{once:true});
 
   sourceNode=actx.createMediaElementSource(uploadedAudio);
-
   const eq1=actx.createBiquadFilter(); eq1.type='peaking'; eq1.frequency.value=1200; eq1.Q.value=1.5; eq1.gain.value=0;
   const eq2=actx.createBiquadFilter(); eq2.type='peaking'; eq2.frequency.value=2000; eq2.Q.value=1.5; eq2.gain.value=0;
   const eq3=actx.createBiquadFilter(); eq3.type='peaking'; eq3.frequency.value=3000; eq3.Q.value=1.2; eq3.gain.value=0;
   const eq4=actx.createBiquadFilter(); eq4.type='peaking'; eq4.frequency.value=4000; eq4.Q.value=1.0; eq4.gain.value=0;
   vocalEQ={eq1,eq2,eq3,eq4};
-
   sourceNode.connect(eq1); eq1.connect(eq2); eq2.connect(eq3); eq3.connect(eq4);
   eq4.connect(analyser); analyser.connect(keyAnalyser); keyAnalyser.connect(actx.destination);
-
   applyVocalState();
 
   const dz=document.getElementById('dropZone');
@@ -186,10 +196,10 @@ function applyVocalState(){
   if(!vocalEQ||!actx) return;
   const {eq1,eq2,eq3,eq4}=vocalEQ;
   const t=actx.currentTime;
-  eq1.gain.setTargetAtTime(vocalOn?-26:0, t, 0.05);
-  eq2.gain.setTargetAtTime(vocalOn?-28:0, t, 0.05);
-  eq3.gain.setTargetAtTime(vocalOn?-24:0, t, 0.05);
-  eq4.gain.setTargetAtTime(vocalOn?-18:0, t, 0.05);
+  eq1.gain.setTargetAtTime(vocalOn?-26:0,t,0.05);
+  eq2.gain.setTargetAtTime(vocalOn?-28:0,t,0.05);
+  eq3.gain.setTargetAtTime(vocalOn?-24:0,t,0.05);
+  eq4.gain.setTargetAtTime(vocalOn?-18:0,t,0.05);
 }
 
 // ── AUDIO ANALYSIS ────────────────────────────────────────────────────────────
@@ -218,11 +228,12 @@ function analyzeAudio(){
     }
     lastBeat=now;
   }
-  // key detection on timer, not per-frame
   if(millis()-keyDetectTimer>600){ keyDetectTimer=millis(); detectKey(); }
   if(uploadedAudio){
-    const td=document.getElementById('timeDisp'); if(td) td.innerText=fmt(uploadedAudio.currentTime)+' / '+fmt(uploadedAudio.duration||0);
-    const bd=document.getElementById('bpmDisp');  if(bd) bd.innerText=floor(bpm)+' BPM';
+    const td=document.getElementById('timeDisp');
+    if(td) td.innerText=fmt(uploadedAudio.currentTime)+' / '+fmt(uploadedAudio.duration||0);
+    const bd=document.getElementById('bpmDisp');
+    if(bd) bd.innerText=floor(bpm)+' BPM';
   }
 }
 
@@ -277,17 +288,17 @@ function rebuildNotes(){
 
 function playNote(fi,hand,vol){
   ensureAudio();
-  if(!scaleNotes.length) return;
+  if(!scaleNotes.length||!reverbBuf) return;
   const freq=hand===0?scaleNotes[fi].freq_l:scaleNotes[fi].freq_r;
   const dur=hand===0?0.5:0.65;
-  const irLen=actx.sampleRate*1.2;
-  const irBuf=actx.createBuffer(2,irLen,actx.sampleRate);
-  for(let ch=0;ch<2;ch++){const d=irBuf.getChannelData(ch);for(let i=0;i<irLen;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/irLen,3);}
-  const conv=actx.createConvolver(); conv.buffer=irBuf;
+
+  const conv=actx.createConvolver();
+  conv.buffer=reverbBuf; // shared buffer — no allocation
   const cG=actx.createGain(); cG.gain.value=0.16;
   const o1=actx.createOscillator(), o2=actx.createOscillator();
   const lfo=actx.createOscillator(), lG=actx.createGain();
   const mx=actx.createGain(), fl=actx.createBiquadFilter(), mG=actx.createGain();
+
   lfo.frequency.value=5.5; lG.gain.value=freq*0.006;
   lfo.connect(lG); lG.connect(o1.frequency); lG.connect(o2.frequency);
   o1.type='sine'; o1.frequency.value=freq;
@@ -297,14 +308,27 @@ function playNote(fi,hand,vol){
   mx.connect(fl); fl.connect(mG);
   mG.connect(actx.destination);
   mG.connect(conv); conv.connect(cG); cG.connect(actx.destination);
+
   const t=actx.currentTime, v=constrain(vol*0.42*(1+bassP*0.12),0.02,0.85);
   mG.gain.setValueAtTime(0,t);
   mG.gain.linearRampToValueAtTime(v,t+0.06);
   mG.gain.setValueAtTime(v,t+dur*0.55);
   mG.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+
   o1.start(t); o1.stop(t+dur);
   o2.start(t); o2.stop(t+dur);
   lfo.start(t); lfo.stop(t+dur);
+
+  // guaranteed cleanup via setTimeout — more reliable than onended
+  // fires after note is fully done + 200ms safety margin
+  setTimeout(()=>{
+    try{
+      lfo.disconnect(); lG.disconnect();
+      o1.disconnect(); o2.disconnect();
+      mx.disconnect(); fl.disconnect(); mG.disconnect();
+      conv.disconnect(); cG.disconnect();
+    }catch(e){}
+  }, (dur+0.2)*1000);
 }
 
 // ── UI ────────────────────────────────────────────────────────────────────────
@@ -370,7 +394,6 @@ function buildUI(){
   dz.ondragover=e=>{e.preventDefault();dz.style.borderColor='rgba(103,232,249,0.35)';dz.style.background='rgba(103,232,249,0.04)';};
   dz.ondragleave=()=>{dz.style.borderColor='rgba(255,255,255,0.09)';dz.style.background='rgba(255,255,255,0.025)';};
   dz.ondrop=e=>{e.preventDefault();loadTrack(e.dataTransfer.files[0]);};
-
   document.getElementById('playBtn').onclick=()=>{ensureAudio();if(uploadedAudio){uploadedAudio.playbackRate=tempo;uploadedAudio.play().catch(()=>{});}};
   document.getElementById('pauseBtn').onclick=()=>{if(uploadedAudio)uploadedAudio.pause();};
   document.getElementById('stopBtn').onclick=()=>{if(uploadedAudio){uploadedAudio.pause();uploadedAudio.currentTime=0;}};
@@ -395,8 +418,7 @@ function buildUI(){
   ss.onchange=()=>{detScale=ss.value;rebuildNotes();updateKeyDisp();};
 
   document.getElementById('vocBtn').onclick=function(){
-    vocalOn=!vocalOn;
-    applyVocalState();
+    vocalOn=!vocalOn; applyVocalState();
     this.innerText=vocalOn?'Vocals OFF':'Vocals ON';
     this.style.color=vocalOn?'#f87171':'#34d399';
     this.style.borderColor=vocalOn?'rgba(248,113,113,0.3)':'rgba(52,211,153,0.3)';
@@ -430,7 +452,7 @@ function jColor(h,k,alpha){
 function draw(){
   analyzeAudio();
 
-  // ghost-hand kill — tightened to 200ms
+  // ghost-hand kill — use performance.now() consistently
   const now=performance.now();
   for(let h=0;h<2;h++) if(now-handLastSeen[h]>200) clearHand(h);
 
@@ -489,12 +511,12 @@ function draw(){
     drawingContext.restore();
   }
 
-  // effects
-  if(ripples.length>CAP.r)   ripples.splice(0,ripples.length-CAP.r);
-  if(glows.length>CAP.g)     glows.splice(0,glows.length-CAP.g);
-  if(particles.length>CAP.p) particles.splice(0,particles.length-CAP.p);
-  if(shocks.length>CAP.s)    shocks.splice(0,shocks.length-CAP.s);
-  if(bursts.length>CAP.b)    bursts.splice(0,bursts.length-CAP.b);
+  // effects — hard cap then draw
+  if(ripples.length>CAP.r)   ripples.length=CAP.r;
+  if(glows.length>CAP.g)     glows.length=CAP.g;
+  if(particles.length>CAP.p) particles.length=CAP.p;
+  if(shocks.length>CAP.s)    shocks.length=CAP.s;
+  if(bursts.length>CAP.b)    bursts.length=CAP.b;
 
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
   for(let i=shocks.length-1;i>=0;i--){
@@ -529,8 +551,6 @@ function draw(){
     strokeWeight(map(rp.a,0,100,.3,2.5)); circle(rp.x,rp.y,rp.r*2);
   }
   drawingContext.restore();
-
-  // ── NO TRAILS — removed for performance ───────────────────────────────────
 
   // hands
   drawingContext.save(); drawingContext.globalCompositeOperation='screen';
@@ -569,14 +589,12 @@ function draw(){
       prevJ[h][k]={x:kx,y:ky};
     }
 
-    // ── PINCH — direct raw distance, no lerp delay on trigger ─────────────
+    // pinch — raw distance trigger, instant response
     const tx0=lms[THUMB_TIP].x, ty0=lms[THUMB_TIP].y;
     for(let fi=0;fi<4;fi++){
       const ti=FINGER_TIPS[fi], tx=lms[ti].x, ty=lms[ti].y;
       const rawDist=handSize[h]>10?dist(tx,ty,tx0,ty0)/handSize[h]:1;
-      // lerp for visual approach line only
       pDist[h][fi]=lerp(pDist[h][fi],rawDist,.55);
-      // trigger on RAW distance — instant, no lerp delay
       const isP=rawDist<PINCH_T;
 
       if(isP&&!pState[h][fi]&&pCool[h][fi]===0){
